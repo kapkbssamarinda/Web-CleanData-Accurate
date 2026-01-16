@@ -205,6 +205,7 @@ with st.sidebar:
     
     st.divider()
     st.caption("Dikembangkan untuk KAP KBS Samarinda")
+    st.caption("Oleh Viany Ramadhany")
 
 # --- UI / UX MAIN PAGE ---
 
