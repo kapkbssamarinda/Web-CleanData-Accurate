@@ -71,7 +71,6 @@ def parse_ledger(uploaded_file):
         return pd.DataFrame()
 
     # --- LOGIKA DINAMIS PENCARIAN KOLOM ---
-    # Kita cari baris yang mengandung kata kunci "Tanggal" dan "Debit" untuk jadi patokan header
     header_row_idx = None
     col_map = {}
 
@@ -79,7 +78,6 @@ def parse_ledger(uploaded_file):
         row_values = [str(x).lower() for x in row.values]
         if 'tanggal' in row_values and 'debit' in row_values:
             header_row_idx = idx
-            # Mapping nama kolom ke index-nya
             for col_idx, val in enumerate(row_values):
                 if 'tanggal' in val: col_map['date'] = col_idx
                 if 'keterangan' in val: col_map['desc'] = col_idx
@@ -88,71 +86,44 @@ def parse_ledger(uploaded_file):
                 if 'balance' in val or 'saldo' in val: col_map['balance'] = col_idx
             break
     
-    # Jika tidak ketemu header standar, fallback ke index manual (file lama)
     if header_row_idx is None:
         st.warning("Format header tidak terdeteksi otomatis. Menggunakan mode kompatibilitas (Format Lama).")
         col_map = {'date': 2, 'desc': 12, 'debit': 19, 'credit': 21, 'balance': 23}
-    
-    # Deteksi posisi kolom Nama Akun & Saldo Awal relatif terhadap kolom Debit
-    # Biasanya Nama Akun ada jauh di kiri, dan Saldo Awal ada di kolom Balance
-    # Kita pakai heuristik: Nama Akun biasanya di baris Header Akun, di kolom yang agak awal.
     
     processed_rows = []
     current_account_name = None
     current_account_type = None
 
-    # Mulai iterasi data (bisa dari baris 0, karena kita pakai logika per-baris)
     for idx, row in df_raw.iterrows():
-        # LOGIKA DETEKSI HEADER AKUN (Baris yang punya Kode Akun di kolom 1)
-        # Ciri: Kolom 1 ada isi, Kolom 0 kosong.
         if pd.notna(row[1]) and pd.isna(row[0]):
-            # Cari Nama Akun & Tipe Akun di baris ini
-            # Nama akun biasanya string panjang non-angka.
-            # Kita cari kolom yang isinya string di baris ini
-            
-            # Coba ambil Nama Akun dari kolom 6 (File Lama) atau kolom 8 (File Baru)
-            # Kita cari nilai string pertama setelah kolom kode akun
             potential_names = []
-            for c in range(2, 10): # Scan kolom 2 sampai 9
+            for c in range(2, 10):
                 val = row[c]
                 if pd.notna(val) and not str(val).replace('.','').isdigit():
                      potential_names.append((c, val))
             
             if potential_names:
-                # Ambil yang pertama ditemukan sebagai Nama Akun
                 current_account_name = potential_names[0][1]
                 
-                # Coba cari Tipe Akun (biasanya 'Kas/Bank', 'Akun Piutang', dll)
-                # Biasanya ada di sebelah kanan Nama Akun
-                current_account_type = "Umum" # Default
+                current_account_type = "Umum"
                 for c in range(potential_names[0][0] + 1, 20):
                     val = row[c]
                     if pd.notna(val) and isinstance(val, str) and len(val) > 3:
                         current_account_type = val
                         break
             
-            # Ambil Saldo Awal
-            # Biasanya ada di kolom yang sama dengan kolom Balance transaksi
-            idx_balance = col_map.get('balance', 23) # Default 23 if not found map
-            # Cek offset kolom balance jika file baru (index 35)
-            # Jika mapping dinamis aktif, pakai col_map['balance']
-            
-            # Khusus Saldo Awal, kadang posisinya geser dikit dari kolom Balance transaksi
-            # Kita coba cari angka di sekitar kolom balance
+            idx_balance = col_map.get('balance', 23)
             opening_balance = 0
             if idx_balance < len(row):
                  opening_balance = row[idx_balance]
             
-            # Jika kosong, coba cari mundur sedikit (kadang alignment beda)
             if pd.isna(opening_balance) or str(opening_balance).strip() == '':
-                 if idx_balance-3 < len(row): # Cek kolom balance di file baru (index 20 vs 35)
-                     # Di file baru: Saldo Awal di 20, Balance Transaksi di 35. Beda jauh.
-                     # Kita cari angka pertama dari kanan di baris header akun
-                     for c in range(len(row)-1, 10, -1):
-                         val = row[c]
-                         if pd.notna(val) and any(char.isdigit() for char in str(val)):
-                             opening_balance = val
-                             break
+                 if idx_balance-3 < len(row): 
+                      for c in range(len(row)-1, 10, -1):
+                          val = row[c]
+                          if pd.notna(val) and any(char.isdigit() for char in str(val)):
+                              opening_balance = val
+                              break
 
             processed_rows.append({
                 "Tanggal": "01/01/2025", 
@@ -164,8 +135,6 @@ def parse_ledger(uploaded_file):
                 "Saldo": clean_number(opening_balance)
             })
             
-        # LOGIKA DETEKSI TRANSAKSI
-        # Syarat: Kolom Tanggal ada isinya, dan bukan header "Tanggal"
         elif pd.notna(row[col_map.get('date', 2)]) and str(row[col_map.get('date', 2)]).strip() != "Tanggal" and current_account_name:
              processed_rows.append({
                 "Tanggal": format_date(row[col_map.get('date', 2)]),
@@ -227,21 +196,17 @@ if uploaded_file:
     
     if df_result is not None and not df_result.empty:
         
-        # --- DASHBOARD RINGKASAN ---
+        # --- DASHBOARD RINGKASAN UTAMA ---
         st.success("✅ Data berhasil diproses!")
         
-        # Hitung Metrics
-        total_debit = df_result['Debit'].sum()
-        total_kredit = df_result['Kredit'].sum()
+        # Hitung Metrics Dasar
         total_rows = len(df_result)
         total_accounts = df_result['Nama Akun'].nunique()
 
-        # Tampilkan Metrics
-        m1, m2, m3, m4 = st.columns(4)
+        # Tampilkan Metrics Global
+        m1, m2 = st.columns(2)
         m1.metric("Total Baris Data", f"{total_rows:,}")
         m2.metric("Jumlah Akun", total_accounts)
-        m3.metric("Total Debit", f"Rp {total_debit:,.0f}")
-        m4.metric("Total Kredit", f"Rp {total_kredit:,.0f}")
 
         st.divider()
 
@@ -253,14 +218,43 @@ if uploaded_file:
             
             # Interaktif Filter
             all_accounts = df_result['Nama Akun'].unique().tolist()
-            selected_accounts = st.multiselect("Filter berdasarkan Nama Akun:", all_accounts, default=None)
+            selected_accounts = st.multiselect("Filter berdasarkan Nama Akun (Pilih 1 untuk lihat Rincian):", all_accounts, default=None)
             
+            # Logic Filter
             if selected_accounts:
                 df_display = df_result[df_result['Nama Akun'].isin(selected_accounts)]
+                
+                # --- FITUR KHUSUS: SALDO HANYA MUNCUL JIKA PILIH 1 AKUN ---
+                if len(selected_accounts) == 1:
+                    # Ambil nama akun
+                    acc_name = selected_accounts[0]
+                    
+                    # 1. Hitung Saldo Awal (Khusus akun ini)
+                    saldo_awal_val = df_display[df_display['Keterangan'] == 'Saldo Awal']['Saldo'].sum()
+                    
+                    # 2. Hitung Saldo Akhir (Angka terakhir di kolom saldo)
+                    if not df_display.empty:
+                        saldo_akhir_val = df_display.iloc[-1]['Saldo']
+                    else:
+                        saldo_akhir_val = 0
+                    
+                    # 3. Hitung Jumlah Transaksi (Total baris termasuk saldo awal)
+                    jumlah_transaksi = len(df_display)
+
+                    # Tampilkan Metric Khusus Akun (3 Kolom)
+                    st.markdown(f"**Rincian Akun: {acc_name}**")
+                    c1, c2, c3 = st.columns(3)
+                    
+                    c1.metric("Saldo Awal", f"Rp {saldo_awal_val:,.2f}")
+                    c2.metric("Saldo Akhir", f"Rp {saldo_akhir_val:,.2f}")
+                    c3.metric("Jml. Transaksi", f"{jumlah_transaksi} Baris")
+                    
+                    st.divider()
+
             else:
                 df_display = df_result
             
-            # Tampilkan Data Editor (Lebih interaktif daripada dataframe biasa)
+            # Tampilkan Data Editor
             st.data_editor(
                 df_display,
                 column_config={
@@ -282,23 +276,22 @@ if uploaded_file:
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df_result.to_excel(writer, index=False, sheet_name='Data_Rapi')
                 
-                # Format kolom Excel agar cantik saat dibuka
+                # Format kolom Excel
                 workbook  = writer.book
                 worksheet = writer.sheets['Data_Rapi']
                 money_fmt = workbook.add_format({'num_format': '#,##0.00'})
                 date_fmt = workbook.add_format({'num_format': 'dd/mm/yyyy'})
                 
-                # Auto-adjust column width (simple estimation)
-                worksheet.set_column('A:D', 20) # Tanggal - Tipe Akun
-                worksheet.set_column('E:E', 50) # Keterangan lebar
-                worksheet.set_column('F:H', 18, money_fmt) # Kolom Angka
+                worksheet.set_column('A:D', 20) 
+                worksheet.set_column('E:E', 50) 
+                worksheet.set_column('F:H', 18, money_fmt) 
 
             st.download_button(
                 label="📥 Download File Excel (.xlsx)",
                 data=buffer,
                 file_name="GL_Cleaned_Data.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary" # Tombol menonjol
+                type="primary"
             )
 
     else:
