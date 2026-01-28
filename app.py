@@ -14,13 +14,40 @@ st.set_page_config(
 # --- FUNGSI UTAMA (LOGIKA BISNIS) ---
 
 def clean_number(value):
-    """Membersihkan format angka akuntansi menjadi float standar."""
+    """
+    Membersihkan format angka akuntansi menjadi float standar.
+    Otomatis mendeteksi format Indonesia (1.000,00) atau US (1,000.00).
+    """
     if pd.isna(value):
         return 0.0
-    val = str(value).replace('(Dr)', '').replace('(Cr)', '').replace('(', '').replace(')', '').strip()
-    val = val.replace('.', '').replace(',', '.')
+    
+    # 1. Bersihkan teks (Hapus (Dr), (Cr), tanda kurung, spasi)
+    val = str(value).replace('(Dr)', '').replace('(Cr)', '').replace('Dr', '').replace('Cr', '')
+    val = val.replace('(', '').replace(')', '').strip()
+    
+    if not val:
+        return 0.0
+
+    # 2. Deteksi Format Berdasarkan Separator Terakhir
+    # Cari posisi terakhir dari titik (.) dan koma (,)
+    last_comma = val.rfind(',')
+    last_dot = val.rfind('.')
+    
     try:
-        return float(val)
+        # KASUS A: Format Indonesia (Desimal pakai Koma)
+        # Ciri: Koma muncul SETELAH titik (1.000,00) ATAU hanya ada koma (100,00)
+        if last_comma > last_dot:
+            # Hapus titik (ribuan), ganti koma jadi titik (desimal)
+            clean_val = val.replace('.', '').replace(',', '.')
+            return float(clean_val)
+            
+        # KASUS B: Format US/Inggris (Desimal pakai Titik)
+        # Ciri: Titik muncul SETELAH koma (1,000.00) ATAU hanya ada titik (1000.0)
+        else:
+            # Hapus koma (ribuan), biarkan titik (desimal)
+            clean_val = val.replace(',', '')
+            return float(clean_val)
+            
     except ValueError:
         return 0.0
 
