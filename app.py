@@ -107,21 +107,29 @@ def parse_ledger(uploaded_file):
             header_row_idx = idx
             for col_idx, val in enumerate(row_values):
                 if 'tanggal' in val: col_map['date'] = col_idx
+                if 'no. sumber' in val or 'no sumber' in val: col_map['source_no'] = col_idx  # Deteksi Kolom No. Sumber
                 if 'keterangan' in val: col_map['desc'] = col_idx
                 if 'debit' in val: col_map['debit'] = col_idx
                 if 'kredit' in val: col_map['credit'] = col_idx
                 if 'balance' in val or 'saldo' in val: col_map['balance'] = col_idx
             break
     
+    # Fallback jika header tidak terdeteksi sempurna (Mode Kompatibilitas)
     if header_row_idx is None:
         st.warning("Format header tidak terdeteksi otomatis. Menggunakan mode kompatibilitas (Format Lama).")
-        col_map = {'date': 2, 'desc': 12, 'debit': 19, 'credit': 21, 'balance': 23}
+        # Asumsi posisi kolom default (bisa disesuaikan jika perlu)
+        col_map = {'date': 2, 'source_no': 8, 'desc': 12, 'debit': 19, 'credit': 21, 'balance': 23} 
     
     processed_rows = []
     current_account_name = None
     current_account_type = None
 
     for idx, row in df_raw.iterrows():
+        # Lewati baris header dan baris sebelumnya
+        if header_row_idx is not None and idx <= header_row_idx:
+            continue
+
+        # LOGIKA DETEKSI NAMA AKUN (HEADER AKUN)
         if pd.notna(row[1]) and pd.isna(row[0]):
             potential_names = []
             for c in range(2, 10):
@@ -132,6 +140,7 @@ def parse_ledger(uploaded_file):
             if potential_names:
                 current_account_name = potential_names[0][1]
                 
+                # Coba deteksi tipe akun di sebelah kanan nama akun
                 current_account_type = "Umum"
                 for c in range(potential_names[0][0] + 1, 20):
                     val = row[c]
@@ -139,11 +148,15 @@ def parse_ledger(uploaded_file):
                         current_account_type = val
                         break
             
+            # --- MENANGANI SALDO AWAL ---
             idx_balance = col_map.get('balance', 23)
             opening_balance = 0
+            
+            # Coba ambil saldo dari kolom Balance
             if idx_balance < len(row):
                  opening_balance = row[idx_balance]
             
+            # Jika kolom balance kosong, cari angka di kolom paling kanan (logika cadangan)
             if pd.isna(opening_balance) or str(opening_balance).strip() == '':
                  if idx_balance-3 < len(row): 
                       for c in range(len(row)-1, 10, -1):
@@ -156,17 +169,34 @@ def parse_ledger(uploaded_file):
                 "Tanggal": "01/01/2025", 
                 "Nama Akun": current_account_name,
                 "Tipe Akun": current_account_type,
+                "No. Sumber": "-", # Saldo awal tidak punya no sumber
                 "Keterangan": "Saldo Awal",
                 "Debit": 0.0,
                 "Kredit": 0.0,
                 "Saldo": clean_number(opening_balance)
             })
             
+        # LOGIKA DETEKSI TRANSAKSI (BARIS DATA)
         elif pd.notna(row[col_map.get('date', 2)]) and str(row[col_map.get('date', 2)]).strip() != "Tanggal" and current_account_name:
+             
+             # Ambil nilai No. Sumber (jika kolom ditemukan)
+             source_val = "-"
+             idx_source = col_map.get('source_no')
+             if idx_source is not None and idx_source < len(row):
+                 val = row[idx_source]
+                 if pd.notna(val):
+                     # Bersihkan format float string (misal: "1234.0" jadi "1234")
+                     source_str = str(val)
+                     if source_str.endswith('.0'):
+                         source_val = source_str[:-2]
+                     else:
+                         source_val = source_str
+             
              processed_rows.append({
                 "Tanggal": format_date(row[col_map.get('date', 2)]),
                 "Nama Akun": current_account_name,
                 "Tipe Akun": current_account_type,
+                "No. Sumber": source_val,
                 "Keterangan": row[col_map.get('desc', 12)],
                 "Debit": clean_number(row[col_map.get('debit', 19)]),
                 "Kredit": clean_number(row[col_map.get('credit', 21)]),
@@ -309,9 +339,11 @@ if uploaded_file:
                 money_fmt = workbook.add_format({'num_format': '#,##0.00'})
                 date_fmt = workbook.add_format({'num_format': 'dd/mm/yyyy'})
                 
-                worksheet.set_column('A:D', 20) 
-                worksheet.set_column('E:E', 50) 
-                worksheet.set_column('F:H', 18, money_fmt) 
+                worksheet.set_column('A:A', 12) # Tanggal
+                worksheet.set_column('B:C', 25) # Nama & Tipe Akun
+                worksheet.set_column('D:D', 15) # No Sumber (Baru!)
+                worksheet.set_column('E:E', 50) # Keterangan
+                worksheet.set_column('F:H', 18, money_fmt) # Debit Kredit Saldo
 
             st.download_button(
                 label="📥 Download File Excel (.xlsx)",
