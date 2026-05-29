@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 import re
+from datetime import datetime
 
 # Konfigurasi Halaman
 st.set_page_config(
@@ -61,38 +62,115 @@ def clean_number(value):
 
 
 def format_date(date_str):
-    """Mengubah format tanggal menjadi DD/MM/YYYY."""
+    """
+    Output: DD/MM/YYYY
+    
+    Supported formats:
+    - DD/MM/YYYY atau DD-MM-YYYY
+    - YYYY-MM-DD (ISO)
+    - DD.MM.YYYY (Eropa)
+    - 1 Jan 2025 / 01 Januari 2025 / 10 nop 2025 (dengan nama bulan)
+    - Excel date serial numbers
+    - pandas.Timestamp
+    """
+    if pd.isna(date_str):
+        return ""
+    
+    # Jika sudah datetime object
+    if isinstance(date_str, pd.Timestamp):
+        return date_str.strftime('%d/%m/%Y')
+    
     if not isinstance(date_str, str):
-        if pd.isna(date_str):
-            return ""
+        # Excel date serial numbers atau numerik
         try:
-            return date_str.strftime('%d/%m/%Y')
-        except Exception:
+            # Coba parsing sebagai Excel date
+            date_obj = pd.to_datetime(date_str)
+            return date_obj.strftime('%d/%m/%Y')
+        except:
             return str(date_str)
 
+    date_str = date_str.strip()
+    if not date_str:
+        return ""
+
     months = {
+        # Singkatan 3 huruf Inggris
         'Jan': '01', 'Feb': '02', 'Mar': '03', 'Apr': '04',
-        'Mei': '05', 'Jun': '06', 'Jul': '07', 'Agu': '08',
-        'Sep': '09', 'Okt': '10', 'Nov': '11', 'Des': '12',
-        'Agustus': '08', 'Januari': '01', 'Februari': '02',
-        'Maret': '03', 'April': '04', 'Juni': '06', 'Juli': '07',
+        'May': '05', 'Jun': '06', 'Jul': '07', 'Aug': '08',
+        'Sep': '09', 'Oct': '10', 'Nov': '11', 'Dec': '12',
+        
+        # Singkatan Indonesia (3 huruf)
+        'Mei': '05', 'Agu': '08', 'Okt': '10', 'Nop': '11', 'Des': '12',
+        
+        # Nama bulan panjang Indonesia
+        'Januari': '01', 'Februari': '02', 'Maret': '03', 'April': '04',
+        'Mei': '05', 'Juni': '06', 'Juli': '07', 'Agustus': '08',
         'September': '09', 'Oktober': '10', 'November': '11', 'Desember': '12',
-        # Bahasa Inggris
-        'January': '01', 'February': '02', 'March': '03', 'May': '05',
-        'June': '06', 'July': '07', 'August': '08', 'September': '09',
-        'October': '10', 'November': '11', 'December': '12',
+        
+        # Nama bulan panjang Inggris
+        'January': '01', 'February': '02', 'March': '03',
+        'June': '06', 'July': '07', 'August': '08',
+        'October': '10', 'December': '12',
     }
 
+    # ===== FORMAT 1: Dengan nama bulan (1 Jan 2025, 10 nop 2025, 10-nop-2025) =====
     try:
-        parts = date_str.split()
-        if len(parts) >= 3:
-            day   = parts[0].zfill(2)
-            month = months.get(parts[1], '01')
-            year  = parts[2]
-            return f"{day}/{month}/{year}"
-    except Exception:
+        match_alpha = re.search(r'(\d{1,2})[\s\-\/]+([a-zA-Z]+)[\s\-\/]+(\d{4})', date_str)
+        if match_alpha:
+            day = match_alpha.group(1).zfill(2)
+            month_input = match_alpha.group(2).lower()
+            year = match_alpha.group(3)
+            
+            months_lower = {k.lower(): v for k, v in months.items()}
+            
+            if month_input in months_lower:
+                return f"{day}/{months_lower[month_input]}/{year}"
+    except:
         pass
-    return date_str
+
+    # ===== FORMAT 2: DD-MM-YYYY atau DD/MM/YYYY =====
+    match = re.match(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})', date_str)
+    if match:
+        day = match.group(1).zfill(2)
+        month = match.group(2).zfill(2)
+        year = match.group(3)
+        return f"{day}/{month}/{year}"
+
+    # ===== FORMAT 3: YYYY-MM-DD (ISO) =====
+    match = re.match(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', date_str)
+    if match:
+        year = match.group(1)
+        month = match.group(2).zfill(2)
+        day = match.group(3).zfill(2)
+        return f"{day}/{month}/{year}"
+
+    # ===== FORMAT 4: DD.MM.YYYY (Jerman/Austria) =====
+    match = re.match(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', date_str)
+    if match:
+        day = match.group(1).zfill(2)
+        month = match.group(2).zfill(2)
+        year = match.group(3)
+        return f"{day}/{month}/{year}"
+
+    # ===== FALLBACK: Coba pandas auto-detect =====
+    try:
+        date_obj = pd.to_datetime(date_str)
+        return date_obj.strftime('%d/%m/%Y')
+    except:
+        return date_str
+
+
+def get_safe_cell_value(row, col_idx, default=""):
+    """
+    HELPER: Ambil nilai cell dengan aman (prevent index out of bounds).
+    """
+    try:
+        if col_idx is None or col_idx >= len(row):
+            return default
+        val = row.iloc[col_idx]
+        return val if pd.notna(val) else default
+    except:
+        return default
 
 
 @st.cache_data(show_spinner=False)
@@ -147,6 +225,8 @@ def parse_ledger(uploaded_file):
     processed_rows = []
     current_account_name = None
     current_account_type = None
+    current_opening_balance = None
+    current_opening_date = None
 
     for idx, row in df_raw.iterrows():
         # Lewati baris header dan baris sebelumnya
@@ -154,7 +234,6 @@ def parse_ledger(uploaded_file):
             continue
 
         # LOGIKA DETEKSI NAMA AKUN (HEADER AKUN)
-        # Ciri: kolom 0 kosong tapi kolom 1 berisi nilai
         if pd.notna(row.iloc[1]) and pd.isna(row.iloc[0]):
             potential_names = []
             for c in range(2, min(10, len(row))):
@@ -176,6 +255,13 @@ def parse_ledger(uploaded_file):
             # --- MENANGANI SALDO AWAL ---
             idx_balance = col_map.get('balance', 23)
             opening_balance = 0
+            opening_date_raw = None
+
+            idx_date = col_map.get('date', 2)
+            if idx_date < len(row):
+                date_val = row.iloc[idx_date]
+                if pd.notna(date_val) and str(date_val).strip() not in ("", "Tanggal"):
+                    opening_date_raw = date_val
 
             # Coba ambil saldo dari kolom Balance
             if idx_balance < len(row):
@@ -189,43 +275,45 @@ def parse_ledger(uploaded_file):
                         opening_balance = val
                         break
 
+            current_opening_date = format_date(opening_date_raw) if opening_date_raw else "01/01/2025"
+            current_opening_balance = clean_number(opening_balance)
+
             processed_rows.append({
-                "Tanggal"   : "01/01/2025",
+                "Tanggal"   : current_opening_date,
                 "Nama Akun" : current_account_name,
                 "Tipe Akun" : current_account_type,
                 "No. Sumber": "-",
                 "Keterangan": "Saldo Awal",
                 "Debit"     : 0.0,
                 "Kredit"    : 0.0,
-                "Saldo"     : clean_number(opening_balance)
+                "Saldo"     : current_opening_balance
             })
 
         # LOGIKA DETEKSI TRANSAKSI (BARIS DATA)
-        elif (
-            pd.notna(row.iloc[col_map.get('date', 2)])
-            and str(row.iloc[col_map.get('date', 2)]).strip() not in ("Tanggal", "")
-            and current_account_name
-        ):
-            # Ambil nilai No. Sumber
-            source_val = "-"
-            idx_source = col_map.get('source_no')
-            if idx_source is not None and idx_source < len(row):
-                val = row.iloc[idx_source]
-                if pd.notna(val):
-                    source_str = str(val)
-                    # Bersihkan format float string (misal "1234.0" → "1234")
-                    source_val = source_str[:-2] if source_str.endswith('.0') else source_str
+        elif current_account_name:
+            date_val = get_safe_cell_value(row, col_map.get('date'), "")
+            
+            if date_val and str(date_val).strip() not in ("Tanggal", ""):
+                source_val = "-"
+                idx_source = col_map.get('source_no')
+                if idx_source is not None and idx_source < len(row):
+                    val = row.iloc[idx_source]
+                    if pd.notna(val):
+                        source_str = str(val)
+                        source_val = source_str[:-2] if source_str.endswith('.0') else source_str
 
-            processed_rows.append({
-                "Tanggal"   : format_date(row.iloc[col_map.get('date', 2)]),
-                "Nama Akun" : current_account_name,
-                "Tipe Akun" : current_account_type,
-                "No. Sumber": source_val,
-                "Keterangan": row.iloc[col_map.get('desc', 12)] if col_map.get('desc', 12) < len(row) else "",
-                "Debit"     : clean_number(row.iloc[col_map.get('debit', 19)]) if col_map.get('debit', 19) < len(row) else 0.0,
-                "Kredit"    : clean_number(row.iloc[col_map.get('credit', 21)]) if col_map.get('credit', 21) < len(row) else 0.0,
-                "Saldo"     : clean_number(row.iloc[col_map.get('balance', 23)]) if col_map.get('balance', 23) < len(row) else 0.0,
-            })
+                formatted_date = format_date(date_val)
+
+                processed_rows.append({
+                    "Tanggal"   : formatted_date,
+                    "Nama Akun" : current_account_name,
+                    "Tipe Akun" : current_account_type,
+                    "No. Sumber": source_val,
+                    "Keterangan": get_safe_cell_value(row, col_map.get('desc'), ""),
+                    "Debit"     : clean_number(get_safe_cell_value(row, col_map.get('debit'), 0.0)),
+                    "Kredit"    : clean_number(get_safe_cell_value(row, col_map.get('credit'), 0.0)),
+                    "Saldo"     : clean_number(get_safe_cell_value(row, col_map.get('balance'), 0.0)),
+                })
 
     if not processed_rows:
         return pd.DataFrame()
@@ -243,14 +331,12 @@ def to_excel(df: pd.DataFrame) -> bytes:
         workbook  = writer.book
         worksheet = writer.sheets['General Ledger']
 
-        # Format
         header_fmt = workbook.add_format({
             'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white',
             'border': 1, 'align': 'center', 'valign': 'vcenter'
         })
         money_fmt = workbook.add_format({'num_format': '#,##0.00'})
 
-        # Lebar kolom
         worksheet.set_column('A:A', 12)        # Tanggal
         worksheet.set_column('B:B', 30)        # Nama Akun
         worksheet.set_column('C:C', 20)        # Tipe Akun
@@ -258,11 +344,9 @@ def to_excel(df: pd.DataFrame) -> bytes:
         worksheet.set_column('E:E', 50)        # Keterangan
         worksheet.set_column('F:H', 18, money_fmt)  # Debit, Kredit, Saldo
 
-        # Tulis ulang header dengan format khusus
         for col_num, col_name in enumerate(df.columns):
             worksheet.write(0, col_num, col_name, header_fmt)
 
-        # Freeze baris header
         worksheet.freeze_panes(1, 0)
 
     return output.getvalue()
@@ -278,8 +362,8 @@ st.caption("Upload file General Ledger dari Accurate / sistem akuntansi lainnya 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Pengaturan")
-    tahun_saldo = st.text_input("Tahun Saldo Awal", value="2025",
-                                 help="Tahun yang akan digunakan pada baris 'Saldo Awal'")
+    tahun_saldo = st.text_input("Tahun Saldo Awal (Fallback)", value="2025",
+                                 help="Tahun fallback jika tanggal saldo awal tidak terdeteksi di file")
     st.divider()
     st.info("**Format yang Didukung:**\n- `.xlsx` / `.xls`\n- `.csv`")
     st.markdown("---")
@@ -300,12 +384,6 @@ if uploaded_file:
     if df is None or df.empty:
         st.error("❌ Tidak ada data yang berhasil diproses. Periksa format file Anda.")
         st.stop()
-
-    # Terapkan tahun saldo awal dari pengaturan sidebar
-    if tahun_saldo.strip():
-        df["Tanggal"] = df["Tanggal"].apply(
-            lambda x: x.replace("2025", tahun_saldo.strip()) if x == "01/01/2025" else x
-        )
 
     st.success(f"✅ Berhasil memproses **{len(df):,} baris** dari **{df['Nama Akun'].nunique()}** akun.")
 
@@ -382,4 +460,13 @@ else:
     2. Upload file tersebut menggunakan tombol di atas
     3. Sistem akan otomatis mendeteksi kolom dan memproses data
     4. Download hasil dalam format **Excel** atau **CSV**
+    
+    #### Format Tanggal yang Didukung
+    - `DD/MM/YYYY` (Indonesia)
+    - `YYYY-MM-DD` (ISO)
+    - `DD-MM-YYYY`
+    - `DD.MM.YYYY` (Eropa)
+    - `01 Jan 2025` (Teks bulan pendek)
+    - `01 Januari 2025` (Teks bulan panjang)
+    - Excel date serial numbers
     """)
