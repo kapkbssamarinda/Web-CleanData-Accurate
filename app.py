@@ -1,653 +1,576 @@
 import streamlit as st
 import pandas as pd
-import io
+import xml.etree.ElementTree as ET
 import re
-from datetime import datetime
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-# =============================================================================
-# KONFIGURASI HALAMAN
-# =============================================================================
-
+# ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="GL Cleaner Pro",
-    page_icon="📊",
+    page_title="GL Cleaner – Accurate 5",
+    page_icon="📒",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# =============================================================================
-# KONSTANTA & KEYWORD MAP
-# =============================================================================
+st.markdown("""
+<style>
+    .stApp { background-color: #0f1b2d; color: #e8dcc8; }
+    .main-title { color: #c9a84c; font-size: 1.8rem; font-weight: 700; margin-bottom: 0; }
+    .sub-title  { color: #8a9bb5; font-size: 0.95rem; margin-top: 4px; margin-bottom: 1.5rem; }
+    .stat-card  {
+        background: #1a2d4a; border: 1px solid #2d4a6e;
+        border-radius: 8px; padding: 16px 20px; text-align: center;
+    }
+    .stat-num { color: #c9a84c; font-size: 1.7rem; font-weight: 700; line-height: 1; }
+    .stat-lbl { color: #8a9bb5; font-size: 0.8rem; margin-top: 4px; }
+    .info-box {
+        background: #132238; border-left: 3px solid #c9a84c;
+        border-radius: 4px; padding: 10px 14px;
+        color: #c8d6e8; font-size: 0.88rem; margin: 8px 0;
+    }
+    .warn-box {
+        background: #2a1a0a; border-left: 3px solid #e07b2a;
+        border-radius: 4px; padding: 10px 14px;
+        color: #e8c8a0; font-size: 0.88rem; margin: 8px 0;
+    }
+    div[data-testid="stDataFrame"] { border: 1px solid #2d4a6e; border-radius: 6px; }
+    .stButton > button {
+        background: #c9a84c; color: #0f1b2d;
+        border: none; font-weight: 600; border-radius: 6px;
+        padding: 0.5rem 2rem; font-size: 1rem;
+    }
+    .stButton > button:hover { background: #e0bf6a; color: #0f1b2d; }
+    .stDownloadButton > button {
+        background: #1a6e3a; color: #d0f0e0;
+        border: none; font-weight: 600; border-radius: 6px;
+        padding: 0.5rem 2rem; font-size: 1rem; width: 100%;
+    }
+    .stDownloadButton > button:hover { background: #228048; }
+    [data-testid="stFileUploader"] {
+        background: #132238; border: 2px dashed #2d4a6e;
+        border-radius: 8px; padding: 10px;
+    }
+    .section-head {
+        color: #c9a84c; font-size: 1rem; font-weight: 600;
+        border-bottom: 1px solid #2d4a6e; padding-bottom: 6px;
+        margin: 1.2rem 0 0.8rem;
+    }
+    .badge {
+        display: inline-block; padding: 2px 8px; border-radius: 10px;
+        font-size: 0.75rem; font-weight: 600;
+    }
+    .badge-ok  { background: #0e3320; color: #50d89a; }
+    .badge-err { background: #3a1010; color: #f07070; }
+</style>
+""", unsafe_allow_html=True)
 
-# Peta keyword untuk setiap field kolom
-# Urutan dalam list menentukan prioritas (lebih awal = lebih diprioritaskan)
-KEYWORD_MAP = {
-    'date'      : ['tanggal', 'tgl', 'date', 'posting date', 'trans date'],
-    'source_no' : ['no. sumber', 'no sumber', 'nosumber', 'no. bukti',
-                   'no bukti', 'source no', 'referensi', 'ref', 'voucher'],
-    'desc'      : ['keterangan', 'uraian', 'narasi', 'deskripsi',
-                   'description', 'memo', 'remark'],
-    'debit'     : ['debit', 'dr', 'debet'],
-    'credit'    : ['kredit', 'credit', 'cr'],
-    'balance'   : ['saldo', 'balance', 'saldo akhir', 'running balance',
-                   'saldo berjalan'],
-}
+# ─── Constants ─────────────────────────────────────────────────────────────────
+OUTPUT_COLS = ["Tanggal", "COA", "Nama Akun", "Sumber", "No. Sumber", "Keterangan", "Debit", "Kredit", "Balance"]
+NS = {"ss": "urn:schemas-microsoft-com:office:spreadsheet"}
 
-# Skor minimum agar baris dianggap sebagai header tabel
-MIN_HEADER_SCORE = 3
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# Batas baris pencarian header (jangan scan seluruh file)
-MAX_HEADER_SCAN_ROWS = 80
-
-# Fallback hardcoded (format Accurate lama)
-FALLBACK_COL_MAP = {
-    'date': 2, 'source_no': 8, 'desc': 12,
-    'debit': 19, 'credit': 21, 'balance': 23
-}
-
-
-# =============================================================================
-# LAYER 1: DETEKSI KOLOM DINAMIS
-# =============================================================================
-
-def score_header_row(row_values: list) -> int:
-    """
-    Beri skor seberapa mungkin baris ini adalah header tabel GL.
-    Semakin banyak keyword cocok, semakin tinggi skor.
-    """
-    score = 0
-    all_keywords = [kw for keywords in KEYWORD_MAP.values() for kw in keywords]
-    for cell in row_values:
-        cell_clean = str(cell).lower().strip()
-        if not cell_clean or cell_clean == 'nan':
-            continue
-        for kw in all_keywords:
-            if kw in cell_clean:
-                score += 1
-                break  # satu cell maksimal 1 poin
-    return score
-
-
-def detect_columns(header_row: list) -> dict:
-    """
-    Petakan kolom berdasarkan keyword matching (partial/substring).
-    Ambil kolom pertama yang cocok untuk setiap field.
-
-    Args:
-        header_row: list string dari satu baris header (belum diubah case-nya)
-
-    Returns:
-        dict col_map, contoh: {'date': 2, 'debit': 5, ...}
-    """
-    col_map = {}
-    for col_idx, cell in enumerate(header_row):
-        cell_clean = str(cell).lower().strip()
-        if not cell_clean or cell_clean == 'nan':
-            continue
-        for field, keywords in KEYWORD_MAP.items():
-            if field not in col_map:  # ambil match pertama saja
-                if any(kw in cell_clean for kw in keywords):
-                    col_map[field] = col_idx
-    return col_map
+def get_cells(row):
+    """Return {col_index: value} for a SpreadsheetML row, handling ss:Index."""
+    result = {}
+    col = 0
+    for cell in row.findall("ss:Cell", NS):
+        idx = cell.get("{urn:schemas-microsoft-com:office:spreadsheet}Index")
+        if idx:
+            col = int(idx) - 1
+        data = cell.find("ss:Data", NS)
+        val = (data.text or "").strip() if data is not None else ""
+        if val:
+            result[col] = val
+        col += 1
+    return result
 
 
-def find_header_row(df_raw: pd.DataFrame) -> tuple[int | None, dict, str]:
-    """
-    Cari baris header terbaik menggunakan sistem skor.
-    Scan maksimal MAX_HEADER_SCAN_ROWS baris pertama.
-
-    Returns:
-        (header_row_idx, col_map, detection_method)
-        detection_method: 'dynamic' | 'fallback'
-    """
-    best_row_idx   = None
-    best_row_score = 0
-
-    scan_limit = min(MAX_HEADER_SCAN_ROWS, len(df_raw))
-
-    for idx in range(scan_limit):
-        row        = df_raw.iloc[idx]
-        row_str    = [str(x) for x in row.values]
-        score      = score_header_row(row_str)
-
-        if score > best_row_score:
-            best_row_score = score
-            best_row_idx   = idx
-
-    if best_row_score >= MIN_HEADER_SCORE and best_row_idx is not None:
-        header_row   = df_raw.iloc[best_row_idx].tolist()
-        col_map      = detect_columns(header_row)
-        return best_row_idx, col_map, 'dynamic'
-    else:
-        return None, FALLBACK_COL_MAP.copy(), 'fallback'
+def is_date(s):
+    return bool(re.match(r"^\d{1,2}\s+\w+\s+\d{4}$", s.strip()))
 
 
-# =============================================================================
-# LAYER 2: TRANSFORMASI DATA
-# =============================================================================
+def is_coa(s):
+    return bool(re.match(r"^\d{3,}[\.\d\-]*$", s.strip()))
 
-def clean_number(value) -> float:
-    """
-    Bersihkan format angka akuntansi → float standar.
-    Mendukung:
-      - Format Indonesia : 1.500.000,75
-      - Format US        : 1,500,000.75
-      - Ribuan tanpa desimal: 500.000 → 500000
-      - Tanda akuntansi  : (Dr), (Cr), tanda kurung negatif
-    """
-    if pd.isna(value):
-        return 0.0
 
-    val = str(value).strip()
-
-    # Hapus label akuntansi
-    for token in ['(Dr)', '(Cr)', 'Dr', 'Cr']:
-        val = val.replace(token, '')
-
-    # Tangani tanda kurung sebagai negatif: (500) → -500
-    is_negative = val.startswith('(') and val.endswith(')')
-    val = val.replace('(', '').replace(')', '').strip()
-
-    if not val:
-        return 0.0
-
-    last_comma = val.rfind(',')
-    last_dot   = val.rfind('.')
-
+def clean_num(s):
+    """Strip thousand separators (dots in ID format), normalise to plain string."""
+    if not s or s == "0,00":
+        return "0"
+    # Remove thousand separators (dots), keep comma as decimal
+    s = re.sub(r"\.", "", s)
+    s = s.replace(",", ".")
     try:
-        if last_comma > last_dot:
-            # Format Indonesia: 1.500.000,75
-            result = float(val.replace('.', '').replace(',', '.'))
-
-        elif last_comma == -1 and last_dot != -1:
-            after_dot  = val[last_dot + 1:]
-            dots_count = val.count('.')
-            # Heuristik ribuan Indonesia: 500.000 atau 1.500.000
-            if len(after_dot) == 3 and after_dot.isdigit() and dots_count >= 1:
-                result = float(val.replace('.', ''))
-            else:
-                result = float(val)
-
-        else:
-            # Format US: 1,500,000.75 atau tanpa separator
-            result = float(val.replace(',', ''))
-
-    except ValueError:
-        return 0.0
-
-    return -result if is_negative else result
+        return str(float(s))
+    except Exception:
+        return s
 
 
-def format_date(date_str) -> str:
+# ─── Auto-detect column layout ────────────────────────────────────────────────
+
+def detect_layout(rows):
     """
-    Normalisasi berbagai format tanggal → DD/MM/YYYY.
-    Mendukung:
-      - DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
-      - YYYY-MM-DD (ISO)
-      - 1 Jan 2025, 01 Januari 2025, 10-nop-2025
-      - Excel date serial numbers
-      - pandas.Timestamp
+    Scan the first ~80 rows to auto-detect column positions.
+    Returns dict with keys: coa, nama_akun, saldo_val, saldo_dc,
+                            tanggal, sumber, no_sumber, keterangan,
+                            debit, kredit, balance
     """
-    if pd.isna(date_str):
-        return ""
+    # Gather all non-empty (col, value) from first 80 rows
+    sample = []
+    for row in rows[:80]:
+        sample.append(get_cells(row))
 
-    if isinstance(date_str, pd.Timestamp):
-        return date_str.strftime('%d/%m/%Y')
+    # --- Detect transaction rows first ---
+    # A transaction row has a date at some column, and numeric-looking values later
+    date_cols = {}
+    for cv in sample:
+        for c, v in cv.items():
+            if is_date(v):
+                date_cols[c] = date_cols.get(c, 0) + 1
 
-    if not isinstance(date_str, str):
-        try:
-            return pd.to_datetime(date_str).strftime('%d/%m/%Y')
-        except Exception:
-            return str(date_str)
+    if not date_cols:
+        return None
 
-    date_str = date_str.strip()
-    if not date_str:
-        return ""
+    tanggal_col = max(date_cols, key=date_cols.get)
 
-    MONTHS = {
-        # Inggris singkat
-        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-        'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-        'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
-        # Indonesia singkat
-        'mei': '05', 'agu': '08', 'okt': '10', 'nop': '11', 'des': '12',
-        # Indonesia panjang
-        'januari': '01', 'februari': '02', 'maret': '03', 'april': '04',
-        'juni': '06', 'juli': '07', 'agustus': '08',
-        'september': '09', 'oktober': '10', 'november': '11', 'desember': '12',
-        # Inggris panjang
-        'january': '01', 'february': '02', 'march': '03',
-        'june': '06', 'july': '07', 'august': '08',
-        'october': '10', 'december': '12',
+    # For transaction rows, find columns relative to tanggal
+    # Typical pattern: sumber ~+5, no_sumber ~+10, keterangan ~+16, debit/kredit/balance after
+    # We'll use heuristics: after tanggal col, find "Bukti Jurnal"/"BJ"/"KK" etc patterns
+    tx_rows = [cv for cv in sample if tanggal_col in cv and is_date(cv[tanggal_col])]
+
+    # Sumber: col with "Bukti Jurnal" / "BJ" / journal-type strings
+    sumber_candidates = {}
+    no_sumber_candidates = {}
+    ket_candidates = {}
+    num_candidates = {}   # columns with numeric-looking values
+
+    for cv in tx_rows:
+        for c, v in cv.items():
+            if c == tanggal_col:
+                continue
+            if re.match(r"^[A-Z]{1,8}[-/]\d+", v):  # No.Sumber: KK-202501001, BP/2025/001
+                no_sumber_candidates[c] = no_sumber_candidates.get(c, 0) + 1
+            elif re.match(r"^(Bukti Jurnal|Bukti Kas|Bukti Bank|Jurnal Umum|Memo|Penyesuaian)$", v, re.I):
+                sumber_candidates[c] = sumber_candidates.get(c, 0) + 1
+            elif re.match(r"^(Bukti Jurnal|BJ|Jurnal)", v, re.I) and len(v) <= 20:
+                sumber_candidates[c] = sumber_candidates.get(c, 0) + 1
+            elif re.match(r"^\d[\d\.,]+$", v):         # numeric string
+                num_candidates[c] = num_candidates.get(c, 0) + 1
+
+    # Keterangan: free-text column between no_sumber and debit
+    # After we have sumber/no_sumber positions, keterangan is next notable text col
+    sumber_col    = max(sumber_candidates,    key=sumber_candidates.get)    if sumber_candidates    else tanggal_col + 5
+    no_sumber_col = max(no_sumber_candidates, key=no_sumber_candidates.get) if no_sumber_candidates else sumber_col + 5
+
+    # Keterangan: text columns after no_sumber, before numeric cols
+    num_cols_sorted = sorted(num_candidates.keys())
+    first_num_col = num_cols_sorted[0] if num_cols_sorted else no_sumber_col + 10
+    ket_text_cols = {}
+    for cv in tx_rows:
+        for c, v in cv.items():
+            if c > no_sumber_col and c < first_num_col:
+                if not re.match(r"^\d[\d\.,]+$", v):
+                    ket_text_cols[c] = ket_text_cols.get(c, 0) + 1
+    ket_col = max(ket_text_cols, key=ket_text_cols.get) if ket_text_cols else no_sumber_col + 6
+
+    # Numeric columns: identify debit, kredit, balance by position + frequency
+    # Balance usually contains "(Dr)" / "(Cr)" prefix
+    balance_candidates = {}
+    for cv in tx_rows:
+        for c, v in cv.items():
+            if re.search(r"\(Dr\)|\(Cr\)", v):
+                balance_candidates[c] = balance_candidates.get(c, 0) + 1
+
+    balance_col = max(balance_candidates, key=balance_candidates.get) if balance_candidates else None
+
+    # Among remaining numeric cols, debit & kredit are the two most frequent
+    # that are NOT balance_col, sorted by column position (debit before kredit)
+    remaining_nums = {c: cnt for c, cnt in num_candidates.items() if c != balance_col}
+    sorted_num = sorted(remaining_nums, key=lambda c: (-remaining_nums[c], c))
+    top_num = sorted(sorted_num[:4])  # take up to 4 highest-frequency, sort by col position
+
+    # Debit = lower col index, Kredit = higher
+    if len(top_num) >= 2:
+        debit_col, kredit_col = top_num[0], top_num[1]
+    elif len(top_num) == 1:
+        debit_col = kredit_col = top_num[0]
+    else:
+        debit_col = ket_col + 8
+        kredit_col = ket_col + 12
+
+    # --- Detect account-header rows ---
+    # Account header: one cell with COA pattern, another with name, optionally saldo
+    coa_candidates = {}
+    nama_candidates = {}
+    saldo_val_candidates = {}
+    saldo_dc_candidates = {}
+
+    for cv in sample:
+        # Skip if this looks like a transaction row
+        if tanggal_col in cv and is_date(cv.get(tanggal_col, "")):
+            continue
+        for c, v in cv.items():
+            if is_coa(v):
+                coa_candidates[c] = coa_candidates.get(c, 0) + 1
+            elif re.match(r"^(Dr|Cr)$", v):
+                saldo_dc_candidates[c] = saldo_dc_candidates.get(c, 0) + 1
+
+    coa_col      = max(coa_candidates,      key=coa_candidates.get)      if coa_candidates      else 1
+    saldo_dc_col = max(saldo_dc_candidates, key=saldo_dc_candidates.get) if saldo_dc_candidates else None
+
+    # Nama Akun: text col near coa_col in header rows, but not coa itself
+    # and not a known numeric or date col
+    hdr_rows = [cv for cv in sample if coa_col in cv and is_coa(cv.get(coa_col, ""))]
+    nama_text_cols = {}
+    for cv in hdr_rows:
+        for c, v in cv.items():
+            if c != coa_col and not is_coa(v) and not re.match(r"^\d[\d\.,]+$", v) and not re.match(r"^(Dr|Cr)$", v):
+                nama_text_cols[c] = nama_text_cols.get(c, 0) + 1
+    nama_col = max(nama_text_cols, key=nama_text_cols.get) if nama_text_cols else coa_col + 7
+
+    # Saldo val: numeric col in header rows
+    saldo_num_cols = {}
+    for cv in hdr_rows:
+        for c, v in cv.items():
+            # Exclude coa_col itself and any column whose value looks like a COA
+            if c == coa_col:
+                continue
+            if re.match(r"^\d[\d\.,]+$", v) and not is_coa(v):
+                saldo_num_cols[c] = saldo_num_cols.get(c, 0) + 1
+    saldo_val_col = max(saldo_num_cols, key=saldo_num_cols.get) if saldo_num_cols else None
+
+    return {
+        "coa":        coa_col,
+        "nama_akun":  nama_col,
+        "saldo_val":  saldo_val_col,
+        "saldo_dc":   saldo_dc_col,
+        "tanggal":    tanggal_col,
+        "sumber":     sumber_col,
+        "no_sumber":  no_sumber_col,
+        "keterangan": ket_col,
+        "debit":      debit_col,
+        "kredit":     kredit_col,
+        "balance":    balance_col,
     }
 
-    # FORMAT 1: Teks bulan — "1 Jan 2025", "10-nop-2025", "01 Januari 2025"
-    match = re.search(r'(\d{1,2})[\s\-\/\.]+([a-zA-Z]+)[\s\-\/\.]+(\d{4})', date_str)
-    if match:
-        day   = match.group(1).zfill(2)
-        month = MONTHS.get(match.group(2).lower(), '')
-        year  = match.group(3)
-        if month:
-            return f"{day}/{month}/{year}"
 
-    # FORMAT 2: DD-MM-YYYY atau DD/MM/YYYY
-    match = re.match(r'^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$', date_str)
-    if match:
-        return f"{match.group(1).zfill(2)}/{match.group(2).zfill(2)}/{match.group(3)}"
+# ─── Parser ───────────────────────────────────────────────────────────────────
 
-    # FORMAT 3: YYYY-MM-DD (ISO)
-    match = re.match(r'^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$', date_str)
-    if match:
-        return f"{match.group(3).zfill(2)}/{match.group(2).zfill(2)}/{match.group(1)}"
-
-    # FORMAT 4: DD.MM.YYYY (Eropa)
-    match = re.match(r'^(\d{1,2})\.(\d{1,2})\.(\d{4})$', date_str)
-    if match:
-        return f"{match.group(1).zfill(2)}/{match.group(2).zfill(2)}/{match.group(3)}"
-
-    # FALLBACK: pandas auto-detect
-    try:
-        return pd.to_datetime(date_str).strftime('%d/%m/%Y')
-    except Exception:
-        return date_str
+def parse_spreadsheetml(file_bytes):
+    """Parse SpreadsheetML XML (Accurate 5 .xls export format)."""
+    tree = ET.parse(io.BytesIO(file_bytes))
+    root = tree.getroot()
+    sheets = root.findall(".//ss:Worksheet", NS)
+    if not sheets:
+        raise ValueError("Tidak ditemukan worksheet dalam file.")
+    return sheets
 
 
-def get_safe_cell(row, col_idx, default=""):
-    """Ambil nilai cell dengan aman (guard index out of bounds)."""
-    try:
-        if col_idx is None or col_idx >= len(row):
-            return default
-        val = row.iloc[col_idx]
-        return val if pd.notna(val) else default
-    except Exception:
-        return default
-
-
-def clean_source_no(val) -> str:
-    """Bersihkan nomor sumber dari trailing .0 (artefak Excel)."""
-    if pd.isna(val):
-        return "-"
-    s = str(val).strip()
-    return s[:-2] if s.endswith('.0') else s
-
-
-# =============================================================================
-# LAYER 3: PARSER UTAMA
-# =============================================================================
-
-@st.cache_data(show_spinner=False)
-def parse_ledger(uploaded_file) -> tuple[pd.DataFrame, dict]:
+def extract_records(rows, layout, keep_raw_balance=True):
     """
-    Parse file GL dari berbagai format (xlsx, xls, csv).
-
-    Returns:
-        (df_result, meta)
-        meta berisi info deteksi: header_row_idx, col_map, detection_method
+    Walk all rows, detect account headers and transaction lines,
+    return list of record dicts.
     """
-    filename = uploaded_file.name.lower()
-    meta     = {}
+    records = []
+    current_coa = ""
+    current_nama = ""
 
-    # --- BACA FILE ---
-    try:
-        if filename.endswith('.csv'):
-            df_raw = pd.read_csv(uploaded_file, header=None, dtype=str)
-        elif filename.endswith('.xls'):
-            df_raw = pd.read_excel(uploaded_file, header=None, dtype=str, engine='xlrd')
-        elif filename.endswith('.xlsx'):
-            df_raw = pd.read_excel(uploaded_file, header=None, dtype=str, engine='openpyxl')
-        else:
-            st.error("Format tidak didukung. Gunakan .csv, .xls, atau .xlsx.")
-            return pd.DataFrame(), meta
-    except Exception as e:
-        st.error(f"Gagal membaca file: {e}")
-        return pd.DataFrame(), meta
+    L = layout  # shorthand
 
-    # --- DETEKSI HEADER (LAYER 1) ---
-    header_row_idx, col_map, detection_method = find_header_row(df_raw)
+    for row in rows:
+        cv = get_cells(row)
+        if not cv:
+            continue
 
-    meta['header_row_idx']   = header_row_idx
-    meta['col_map']          = col_map
-    meta['detection_method'] = detection_method
-    meta['total_raw_rows']   = len(df_raw)
+        c1 = cv.get(L["coa"], "")
 
-    # --- PROSES BARIS ---
-    processed_rows          = []
-    current_account_name    = None
-    current_account_type    = None
+        # ── Account header row ─────────────────────────────────────
+        if c1 and is_coa(c1) and cv.get(L["nama_akun"]):
+            current_coa  = c1
+            current_nama = cv.get(L["nama_akun"], "")
 
-    start_idx = (header_row_idx + 1) if header_row_idx is not None else 0
+            saldo_raw = cv.get(L["saldo_val"], "0,00") if L["saldo_val"] else "0,00"
+            dc = cv.get(L["saldo_dc"], "") if L["saldo_dc"] else ""
 
-    for idx in range(start_idx, len(df_raw)):
-        row = df_raw.iloc[idx]
+            if dc == "Dr":
+                debit_sa, kredit_sa = saldo_raw, "0,00"
+            elif dc == "Cr":
+                debit_sa, kredit_sa = "0,00", saldo_raw
+            else:
+                debit_sa, kredit_sa = saldo_raw, "0,00"
 
-        # ── DETEKSI HEADER AKUN ──────────────────────────────────────────────
-        # Ciri: kolom 0 kosong, kolom 1 ada isi (nama akun di Accurate)
-        col0_empty = pd.isna(row.iloc[0]) or str(row.iloc[0]).strip() == ''
-        col1_filled = len(row) > 1 and pd.notna(row.iloc[1]) and str(row.iloc[1]).strip() != ''
+            balance_sa = saldo_raw  # plain number, no Dr/Cr prefix
 
-        if col0_empty and col1_filled:
-            # Cari nama akun: ambil nilai non-kosong pertama mulai kolom 2
-            account_name = None
-            account_type = "Umum"
-            name_col_idx = None
-
-            for c in range(2, min(12, len(row))):
-                val = str(row.iloc[c]).strip()
-                if val and val.lower() != 'nan':
-                    account_name = val
-                    name_col_idx = c
-                    break
-
-            if not account_name:
-                continue
-
-            # Cari tipe akun di sebelah kanan nama akun
-            if name_col_idx is not None:
-                for c in range(name_col_idx + 1, min(25, len(row))):
-                    val = str(row.iloc[c]).strip()
-                    if val and val.lower() != 'nan':
-                        account_type = val
-                        break
-
-            current_account_name = account_name
-            current_account_type = account_type
-
-            # ── SALDO AWAL ───────────────────────────────────────────────────
-            date_raw      = get_safe_cell(row, col_map.get('date'), None)
-            opening_date  = format_date(date_raw) if date_raw else "01/01/2025"
-
-            # Coba ambil saldo dari kolom balance, fallback ke kolom paling kanan
-            bal_raw = get_safe_cell(row, col_map.get('balance'), None)
-            if bal_raw is None or str(bal_raw).strip() in ('', 'nan'):
-                for c in range(len(row) - 1, 10, -1):
-                    val = str(row.iloc[c]).strip()
-                    if val and val.lower() != 'nan':
-                        bal_raw = val
-                        break
-
-            opening_balance = clean_number(bal_raw)
-
-            processed_rows.append({
-                "Tanggal"   : opening_date,
-                "Nama Akun" : current_account_name,
-                "Tipe Akun" : current_account_type,
-                "No. Sumber": "-",
+            records.append({
+                "Tanggal":    "Saldo Awal",
+                "COA":        current_coa,
+                "Nama Akun":  current_nama,
+                "Sumber":     "",
+                "No. Sumber": "",
                 "Keterangan": "Saldo Awal",
-                "Debit"     : 0.0,
-                "Kredit"    : 0.0,
-                "Saldo"     : opening_balance,
+                "Debit":      debit_sa,
+                "Kredit":     kredit_sa,
+                "Balance":    balance_sa,
+                "_is_saldo":  True,
+            })
+            continue
+
+        # ── Transaction row ────────────────────────────────────────
+        tanggal = cv.get(L["tanggal"], "")
+        if tanggal and is_date(tanggal):
+            balance_raw = cv.get(L["balance"], "") if L["balance"] else ""
+            balance_val = re.sub(r"\(Dr\)\s*|\(Cr\)\s*", "", balance_raw).strip()
+            records.append({
+                "Tanggal":    tanggal,
+                "COA":        current_coa,
+                "Nama Akun":  current_nama,
+                "Sumber":     cv.get(L["sumber"], ""),
+                "No. Sumber": cv.get(L["no_sumber"], ""),
+                "Keterangan": cv.get(L["keterangan"], ""),
+                "Debit":      cv.get(L["debit"], "0,00"),
+                "Kredit":     cv.get(L["kredit"], "0,00"),
+                "Balance":    balance_val,
+                "_is_saldo":  False,
             })
 
-        # ── DETEKSI BARIS TRANSAKSI ──────────────────────────────────────────
-        elif current_account_name:
-            date_val = get_safe_cell(row, col_map.get('date'), "")
-            date_str = str(date_val).strip()
-
-            # Skip baris kosong atau baris summary (tidak ada tanggal valid)
-            if not date_str or date_str.lower() in ('nan', 'tanggal', 'date', ''):
-                continue
-
-            processed_rows.append({
-                "Tanggal"   : format_date(date_val),
-                "Nama Akun" : current_account_name,
-                "Tipe Akun" : current_account_type,
-                "No. Sumber": clean_source_no(get_safe_cell(row, col_map.get('source_no'), "-")),
-                "Keterangan": str(get_safe_cell(row, col_map.get('desc'), "")),
-                "Debit"     : clean_number(get_safe_cell(row, col_map.get('debit'), 0.0)),
-                "Kredit"    : clean_number(get_safe_cell(row, col_map.get('credit'), 0.0)),
-                "Saldo"     : clean_number(get_safe_cell(row, col_map.get('balance'), 0.0)),
-            })
-
-    if not processed_rows:
-        return pd.DataFrame(), meta
-
-    df = pd.DataFrame(processed_rows)
-    df["Keterangan"] = df["Keterangan"].fillna("").astype(str)
-    return df, meta
+    return records
 
 
-# =============================================================================
-# LAYER 4: OUTPUT
-# =============================================================================
+# ─── XLSX export ──────────────────────────────────────────────────────────────
 
-def to_excel(df: pd.DataFrame) -> bytes:
-    """Ekspor DataFrame ke bytes Excel dengan format akuntansi profesional."""
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='General Ledger')
-        wb  = writer.book
-        ws  = writer.sheets['General Ledger']
+def build_xlsx(records_df):
+    """
+    Build a clean, filter-friendly XLSX.
+    Uses iloc positional access — avoids itertuples mangling column names
+    that contain spaces or dots (e.g. "Nama Akun", "No. Sumber").
+    """
+    import math
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Buku Besar"
 
-        # Format
-        fmt_header = wb.add_format({
-            'bold': True, 'bg_color': '#2E75B6', 'font_color': 'white',
-            'border': 1, 'align': 'center', 'valign': 'vcenter',
-            'text_wrap': True,
-        })
-        fmt_money  = wb.add_format({'num_format': '#,##0.00'})
-        fmt_date   = wb.add_format({'align': 'center'})
-        fmt_center = wb.add_format({'align': 'center'})
-        fmt_alt    = wb.add_format({'bg_color': '#EBF3FB'})
-        fmt_alt_money = wb.add_format({'bg_color': '#EBF3FB', 'num_format': '#,##0.00'})
+    hdr_font  = Font(name="Calibri", bold=True, size=10, color="FFFFFF")
+    hdr_fill  = PatternFill("solid", fgColor="0F3460")
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    cell_border = Border(bottom=Side(style="thin", color="EBEBEB"))
 
-        # Lebar kolom
-        ws.set_column('A:A', 13, fmt_date)     # Tanggal
-        ws.set_column('B:B', 35)               # Nama Akun
-        ws.set_column('C:C', 22)               # Tipe Akun
-        ws.set_column('D:D', 16, fmt_center)   # No. Sumber
-        ws.set_column('E:E', 55)               # Keterangan
-        ws.set_column('F:H', 20, fmt_money)    # Debit, Kredit, Saldo
+    for col_idx, col_name in enumerate(OUTPUT_COLS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font      = hdr_font
+        cell.fill      = hdr_fill
+        cell.alignment = hdr_align
 
-        # Tulis ulang header dengan format
-        for col_num, col_name in enumerate(df.columns):
-            ws.write(0, col_num, col_name, fmt_header)
-            ws.set_row(0, 22)
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 20
 
-        # Alternating row color
-        money_cols = {
-            df.columns.get_loc('Debit'),
-            df.columns.get_loc('Kredit'),
-            df.columns.get_loc('Saldo'),
-        }
-        for row_num in range(1, len(df) + 1):
-            is_alt = row_num % 2 == 0
-            for col_num in range(len(df.columns)):
-                val = df.iloc[row_num - 1, col_num]
-                if col_num in money_cols:
-                    ws.write_number(row_num, col_num, float(val) if val else 0.0,
-                                    fmt_alt_money if is_alt else fmt_money)
-                else:
-                    ws.write(row_num, col_num, val,
-                             fmt_alt if is_alt else None)
+    saldo_fill  = PatternFill("solid", fgColor="EBF5FF")
+    right_cols  = {"Debit", "Kredit", "Balance"}
 
-        ws.freeze_panes(1, 0)
-        ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+    # Build positional index maps — safe against spaces/dots in column names
+    all_cols      = list(records_df.columns)
+    out_positions = [all_cols.index(c) for c in OUTPUT_COLS]
+    saldo_pos     = all_cols.index("_is_saldo")
 
-    return output.getvalue()
+    def safe_str(v):
+        if v is None: return ""
+        if isinstance(v, float) and math.isnan(v): return ""
+        return str(v)
+
+    for df_idx in range(len(records_df)):
+        row_vals = records_df.iloc[df_idx]
+        is_saldo = bool(row_vals.iloc[saldo_pos])
+        xlsx_row = df_idx + 2
+        for col_idx, pos in enumerate(out_positions, 1):
+            col_name = OUTPUT_COLS[col_idx - 1]
+            val      = safe_str(row_vals.iloc[pos])
+            cell     = ws.cell(row=xlsx_row, column=col_idx, value=val)
+            cell.font      = Font(name="Calibri", size=10)
+            cell.alignment = Alignment(
+                horizontal="right" if col_name in right_cols else "left",
+                vertical="center",
+            )
+            if is_saldo:
+                cell.fill = saldo_fill
+            cell.border = cell_border
+
+    col_max = {col: len(col) for col in OUTPUT_COLS}
+    for df_idx in range(len(records_df)):
+        row_vals = records_df.iloc[df_idx]
+        for col_name, pos in zip(OUTPUT_COLS, out_positions):
+            val = safe_str(row_vals.iloc[pos])
+            col_max[col_name] = min(max(col_max[col_name], len(val)), 60)
+
+    for col_idx, col_name in enumerate(OUTPUT_COLS, 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = col_max[col_name] + 3
+
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(OUTPUT_COLS))}{ws.max_row}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
-# =============================================================================
-# UI STREAMLIT
-# =============================================================================
+# ─── UI ───────────────────────────────────────────────────────────────────────
 
-# --- HEADER ---
-st.title("📊 GL Cleaner Pro")
-st.caption("Bersihkan dan standarisasi General Ledger dari Accurate / software akuntansi lainnya secara otomatis.")
+st.markdown('<p class="main-title">📒 GL Cleaner — Accurate 5</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Bersihkan & ekspor Buku Besar Rinci dari Accurate 5 Desktop menjadi Excel yang bisa di-filter</p>', unsafe_allow_html=True)
 
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Pengaturan")
-
-    fallback_year = st.text_input(
-        "Tahun Fallback Saldo Awal", value="2025",
-        help="Digunakan jika tanggal saldo awal tidak terdeteksi di file"
-    )
-
-    st.divider()
-    st.markdown("**Format File yang Didukung**")
-    st.info("`.xlsx` · `.xls` · `.csv`")
-
-    st.divider()
-    st.markdown("**Kolom Output**")
-    st.markdown("""
-    - Tanggal  
-    - Nama Akun  
-    - Tipe Akun  
-    - No. Sumber  
-    - Keterangan  
-    - Debit  
-    - Kredit  
-    - Saldo  
-    """)
-
-    st.divider()
-    st.markdown("**Tentang Deteksi Kolom**")
-    st.markdown("""
-    Sistem secara otomatis mencari baris header di 80 baris pertama 
-    menggunakan sistem **skor keyword**. Semakin banyak kata kunci 
-    akuntansi yang cocok, baris itu dipilih sebagai header.
-    """)
-
-# --- UPLOAD ---
-uploaded_file = st.file_uploader(
-    "Upload File General Ledger",
-    type=["xlsx", "xls", "csv"],
-    help="File Excel atau CSV hasil export dari Accurate / sistem lain."
+# ── Upload ─────────────────────────────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "Upload file ekspor Buku Besar (.xls / .xlsx dari Accurate 5)",
+    type=["xls", "xlsx"],
+    help="File SpreadsheetML XML yang dihasilkan Accurate 5 Desktop",
 )
 
-if uploaded_file:
-    with st.spinner("Memproses dan mendeteksi struktur file..."):
-        result = parse_ledger(uploaded_file)
+if not uploaded:
+    st.markdown("""
+    <div class="info-box">
+    ℹ️ <b>Cara pakai:</b><br>
+    1. Di Accurate 5 Desktop, buka <b>Buku Besar Rinci</b> → klik <b>Ekspor ke Excel</b><br>
+    2. Upload file .xls hasil ekspor di atas<br>
+    3. Preview data, lalu klik <b>Download XLSX</b>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
 
-    # Handle return value (df, meta)
-    if isinstance(result, tuple):
-        df, meta = result
-    else:
-        df, meta = result, {}
+# ── Parse ──────────────────────────────────────────────────────────────────────
+with st.spinner("Membaca dan mendeteksi struktur file..."):
+    try:
+        file_bytes = uploaded.read()
 
-    if df is None or df.empty:
-        st.error("❌ Tidak ada data yang berhasil diproses. Periksa format file Anda.")
+        # Check if SpreadsheetML
+        header_bytes = file_bytes[:200]
+        is_xml = b"<?xml" in header_bytes or b"<Workbook" in header_bytes
+
+        if not is_xml:
+            st.error("Format file tidak dikenali. Pastikan file adalah hasil ekspor Accurate 5 (SpreadsheetML).")
+            st.stop()
+
+        sheets = parse_spreadsheetml(file_bytes)
+
+        # Use first sheet
+        sheet = sheets[0]
+        sheet_name = sheet.get("{urn:schemas-microsoft-com:office:spreadsheet}Name", "Sheet 1")
+        table = sheet.find("ss:Table", NS)
+        rows  = table.findall("ss:Row", NS)
+
+        # Auto-detect layout
+        layout = detect_layout(rows)
+        if layout is None:
+            st.error("Tidak dapat mendeteksi struktur kolom. Pastikan file berisi data transaksi Buku Besar.")
+            st.stop()
+
+        # Extract records
+        records = extract_records(rows, layout)
+
+    except ET.ParseError as e:
+        st.error(f"File XML tidak valid: {e}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Gagal membaca file: {e}")
         st.stop()
 
-    # --- INFO DETEKSI ---
-    detection_method = meta.get('detection_method', 'unknown')
-    col_map          = meta.get('col_map', {})
-    header_row_idx   = meta.get('header_row_idx')
+# ── Stats ──────────────────────────────────────────────────────────────────────
+if not records:
+    st.warning("Tidak ada data transaksi yang berhasil diekstrak.")
+    st.stop()
 
-    if detection_method == 'dynamic':
-        st.success(
-            f"✅ Header terdeteksi otomatis di **baris {header_row_idx + 1}** "
-            f"dengan **{len(col_map)} kolom** dipetakan."
-        )
-    else:
-        st.warning(
-            "⚠️ Header tidak terdeteksi otomatis. "
-            "Menggunakan **mode kompatibilitas** (format kolom Accurate lama)."
-        )
+df_all = pd.DataFrame(records)
+df_out = df_all[OUTPUT_COLS + ["_is_saldo"]].copy()
 
-    # Detail mapping kolom (expandable)
-    with st.expander("🔍 Detail Pemetaan Kolom yang Terdeteksi", expanded=False):
-        if col_map:
-            mapping_data = [
-                {"Field": field, "Index Kolom": idx,
-                 "Nama Kolom di File": f"Kolom {idx}"}
-                for field, idx in col_map.items()
-            ]
-            st.dataframe(pd.DataFrame(mapping_data), use_container_width=True, hide_index=True)
-        else:
-            st.info("Tidak ada info pemetaan tersedia.")
+n_saldo = df_out["_is_saldo"].sum()
+n_tx    = len(df_out) - n_saldo
+n_akun  = df_out[df_out["_is_saldo"]]["COA"].nunique()
+n_sheet = len(sheets)
 
-    st.divider()
+c1, c2, c3, c4 = st.columns(4)
+for col, num, label in [
+    (c1, n_tx,    "Transaksi"),
+    (c2, n_akun,  "Akun (COA)"),
+    (c3, n_saldo, "Baris Saldo Awal"),
+    (c4, len(rows), "Total Baris File"),
+]:
+    col.markdown(f'<div class="stat-card"><div class="stat-num">{num:,}</div><div class="stat-lbl">{label}</div></div>', unsafe_allow_html=True)
 
-    # --- METRIK RINGKAS ---
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Baris",  f"{len(df):,}")
-    c2.metric("Jumlah Akun",  f"{df['Nama Akun'].nunique():,}")
-    c3.metric("Total Debit",  f"Rp {df['Debit'].sum():,.0f}")
-    c4.metric("Total Kredit", f"Rp {df['Kredit'].sum():,.0f}")
+# ── Layout info ────────────────────────────────────────────────────────────────
+with st.expander("🔍 Hasil deteksi kolom otomatis", expanded=False):
+    labels = {
+        "coa": "COA", "nama_akun": "Nama Akun", "saldo_val": "Saldo Awal",
+        "saldo_dc": "Dr/Cr Saldo", "tanggal": "Tanggal", "sumber": "Sumber",
+        "no_sumber": "No. Sumber", "keterangan": "Keterangan",
+        "debit": "Debit", "kredit": "Kredit", "balance": "Balance",
+    }
+    rows_det = []
+    for key, label in labels.items():
+        col_idx = layout.get(key)
+        col_letter = get_column_letter(col_idx + 1) if col_idx is not None else "—"
+        rows_det.append({"Kolom Output": label, "Posisi Kolom (0-based)": col_idx, "Huruf Kolom": col_letter})
+    st.dataframe(pd.DataFrame(rows_det), use_container_width=True, hide_index=True)
 
-    st.divider()
+# ── Filter sidebar ─────────────────────────────────────────────────────────────
+st.sidebar.markdown("## Filter Data")
 
-    # --- FILTER ---
-    with st.expander("🔍 Filter Data", expanded=False):
-        fc1, fc2, fc3 = st.columns(3)
+all_coa = sorted(df_out["COA"].dropna().unique().tolist())
+sel_coa = st.sidebar.multiselect("COA / Akun", all_coa, default=[])
 
-        akun_list     = ["Semua"] + sorted(df["Nama Akun"].dropna().unique().tolist())
-        selected_akun = fc1.selectbox("Nama Akun", akun_list)
+all_sumber = sorted(df_out["Sumber"].dropna().replace("", pd.NA).dropna().unique().tolist())
+sel_sumber = st.sidebar.multiselect("Sumber", all_sumber, default=[])
 
-        tipe_list     = ["Semua"] + sorted(df["Tipe Akun"].dropna().unique().tolist())
-        selected_tipe = fc2.selectbox("Tipe Akun", tipe_list)
+search_ket = st.sidebar.text_input("Cari Keterangan", "")
+show_saldo = st.sidebar.checkbox("Tampilkan baris Saldo Awal", value=True)
 
-        ket_filter    = fc3.text_input("Keterangan mengandung...")
+# Apply filters
+df_view = df_out.copy()
+if sel_coa:
+    df_view = df_view[df_view["COA"].isin(sel_coa)]
+if sel_sumber:
+    df_view = df_view[df_view["Sumber"].isin(sel_sumber)]
+if search_ket:
+    df_view = df_view[df_view["Keterangan"].str.contains(search_ket, case=False, na=False)]
+if not show_saldo:
+    df_view = df_view[~df_view["_is_saldo"]]
 
-    df_filtered = df.copy()
-    if selected_akun != "Semua":
-        df_filtered = df_filtered[df_filtered["Nama Akun"] == selected_akun]
-    if selected_tipe != "Semua":
-        df_filtered = df_filtered[df_filtered["Tipe Akun"] == selected_tipe]
-    if ket_filter.strip():
-        df_filtered = df_filtered[
-            df_filtered["Keterangan"].str.contains(ket_filter.strip(), case=False, na=False)
-        ]
+# ── Preview ────────────────────────────────────────────────────────────────────
+st.markdown(f'<p class="section-head">Preview — {len(df_view):,} baris</p>', unsafe_allow_html=True)
 
-    # --- TABEL PREVIEW ---
-    st.subheader(f"📋 Preview Data  —  {len(df_filtered):,} baris ditampilkan")
-    st.dataframe(
-        df_filtered,
-        use_container_width=True,
-        height=460,
-        column_config={
-            "Debit" : st.column_config.NumberColumn("Debit",  format="Rp %.2f"),
-            "Kredit": st.column_config.NumberColumn("Kredit", format="Rp %.2f"),
-            "Saldo" : st.column_config.NumberColumn("Saldo",  format="Rp %.2f"),
-        }
-    )
+st.dataframe(
+    df_view[OUTPUT_COLS].head(500),
+    use_container_width=True,
+    hide_index=True,
+    height=420,
+)
 
-    st.divider()
+if len(df_view) > 500:
+    st.caption(f"⚠️ Preview dibatasi 500 baris. File XLSX akan berisi semua {len(df_view):,} baris.")
 
-    # --- DOWNLOAD ---
-    st.subheader("💾 Download Hasil")
-    dc1, dc2 = st.columns(2)
-    base_name = uploaded_file.name.rsplit('.', 1)[0]
+# ── Download ───────────────────────────────────────────────────────────────────
+st.markdown('<p class="section-head">Export</p>', unsafe_allow_html=True)
 
-    with dc1:
-        excel_bytes = to_excel(df_filtered)
-        st.download_button(
-            label           = "📥 Download Excel (.xlsx)",
-            data            = excel_bytes,
-            file_name       = f"{base_name}_cleaned.xlsx",
-            mime            = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+export_choice = st.radio(
+    "Data yang diekspor:",
+    ["Semua data (tanpa filter)", "Data sesuai filter aktif"],
+    horizontal=True,
+)
 
-    with dc2:
-        csv_bytes = df_filtered.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label           = "📄 Download CSV (.csv)",
-            data            = csv_bytes,
-            file_name       = f"{base_name}_cleaned.csv",
-            mime            = "text/csv",
-            use_container_width=True,
-        )
+df_export = df_out if export_choice.startswith("Semua") else df_view
 
-else:
-    st.info("👆 Upload file General Ledger di atas untuk memulai.")
+with st.spinner("Menyiapkan file XLSX..."):
+    xlsx_bytes = build_xlsx(df_export)
 
-    st.markdown("""
-    #### Cara Penggunaan
-    1. Export General Ledger dari Accurate ke format **Excel** atau **CSV**
-    2. Upload file menggunakan tombol di atas
-    3. Sistem otomatis mendeteksi kolom dan memproses data
-    4. Download hasilnya dalam format **Excel** atau **CSV**
+fname_base = uploaded.name.rsplit(".", 1)[0]
+st.download_button(
+    label=f"⬇️  Download XLSX  ({len(df_export):,} baris)",
+    data=xlsx_bytes,
+    file_name=f"{fname_base}_clean.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
-    #### Format Tanggal yang Didukung
-    | Format | Contoh |
-    |---|---|
-    | DD/MM/YYYY | `25/12/2024` |
-    | DD-MM-YYYY | `25-12-2024` |
-    | YYYY-MM-DD | `2024-12-25` |
-    | DD.MM.YYYY | `25.12.2024` |
-    | Bulan teks pendek | `25 Des 2024`, `25-nop-2024` |
-    | Bulan teks panjang | `25 Desember 2024` |
-    | Excel serial number | otomatis |
-    """)
+st.markdown("""
+<div class="info-box" style="margin-top:1rem;">
+ℹ️ Output XLSX: header beku di baris 1 · AutoFilter aktif · lebar kolom otomatis · baris Saldo Awal diberi warna biru muda · tanpa formula · siap di-filter / pivot
+</div>
+""", unsafe_allow_html=True)
